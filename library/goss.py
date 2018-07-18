@@ -1,137 +1,155 @@
 #!/usr/bin/env python
-
-from __future__ import absolute_import, print_function
-
-import json, os, re, sys
+import os
 from ansible.module_utils.basic import *
-from ansible.module_utils.six import integer_types, string_types
-
-
-BOOLEAN_MATCHER = re.compile(r'(?P<value>True|False)', re.I)
 
 DOCUMENTATION = '''
 ---
 module: goss
-author: Naftuli Kay
-short_description: Execute a Goss Test
+author: Mathieu Corbin
+short_description: Launch goss (https://github.com/aelsabbahy/goss) tests
 description:
-  - Executes a Goss test. Changed always false if tests succeeded
+  - Launch goss tests.
+    This module always returns `changed = false` for idempotence.
 options:
   path:
     required: true
     description:
-      - A Goss test file to execute, locally available on the remote machine.
-  cwd:
+      - Test file to validate.
+        The test file must be on the remote machine.
+  goss_path:
     required: false
-    default: $HOME
     description:
-      - The working directory to operate from.
+      - Path location for the goss executable.
+        Default is "goss" (ie.`no absolute path,  goss executable must be available in $PATH).
   format:
     required: false
-    default: rspecish
-    choices: [rspecish, documentation, json, tap, junit, nagios, nagios_verbose, silent]
     description:
-      - Modify the Goss output format.
-  executable:
+      - Output goss format.
+        Goss format list : goss v --format => [documentation json junit nagios nagios_verbose rspecish tap silent].
+        Default is "rspecish".
+  output_file:
     required: false
-    default: goss
     description:
-      - The executable to use when invoking Goss.
-  env_vars:
-    required: false
-    default: \{\}
-    description:
-      - A map of environment variables to set when running Goss.
+      - Save the result of the goss command in a file whose path is output_file
 
 examples:
-  - name: execute goss file
-    goss: path=/path/to/file.yml
+  - name: run goss against the gossfile /path/to/file.yml
+    goss:
+      path: "/path/to/file.yml"
 
-  - name: execute goss file with json output
-    goss: path=/path/to/file.yml format=json
+  - name: run goss against the gossfile /path/to/file.yml with nagios output
+    goss:
+      path: "/path/to/file.yml"
+      format: "nagios"
 
-  - name: custom goss
-    goss: path=/path/to/file.yml executable=/tmp/goss
+  - name: run /usr/local/bin/goss against the gossfile /path/to/file.yml
+    goss:
+      path: "/path/to/file.yml"
+      goss_path: "/usr/local/bin/goss"
+
+  - name: run goss against multiple gossfiles and write the result in JSON format to /my/output/ for each file
+    goss:
+      path: "{{ item }}"
+      format: json
+      output_file : /my/output/{{ item }}
+    with_items: "{{ goss_files }}"
 '''
 
-GOSS_OUTPUT_FORMATS = ("rspecish", "documentation", "json", "tap", "junit", "nagios", "nagios_verbose", "silent")
-
-def log(msg):
-    sys.stderr.write("{}\n".format(msg))
-
-# launch goss validate command on the file
-def evaluate(module, test_file, output_format, executable, env_vars, cwd):
-    return module.run_command(
-        "{0} -g {1} validate --format {2}".format(executable, test_file, output_format),
-        environ_update=env_vars, cwd=cwd,
-    )
 
 def succeed(module, **kwargs):
     module.exit_json(changed=False, failed=False, goss_failed=False, **kwargs)
 
+
 def fail(module, message, **kwargs):
     module.fail_json(msg=message, failed=True, goss_failed=True, **kwargs)
+
+
+# launch goss validate command on the file
+def check(module, test_file_path, vars_file_path, output_format, goss_path):
+    global_options = "-g %s" % test_file_path
+    global_options = "%s --vars %s" % (global_options, vars_file_path) if vars_file_path else global_options
+    command_options = "--format %s" % output_format if output_format else ""
+    cmd = "%s %s v %s" % (goss_path, global_options, command_options)
+    return module.run_command(cmd)
+
+
+# write goss result to output_file_path
+def output_file(output_file_path, out):
+    if output_file_path is not None:
+        with open(output_file_path, 'w') as output_file:
+            output_file.write(out)
+
 
 def main():
     module = AnsibleModule(
         argument_spec=dict(
             path=dict(required=True, type='str'),
-            cwd=dict(required=False, type='str', default=os.path.expanduser('.')),
-            format=dict(required=False, type='str', choices=GOSS_OUTPUT_FORMATS),
-            executable=dict(required=False, type='str', default='goss'),
-            env_vars=dict(required=False, type='dict', default={})
+            vars=dict(required=False, type='str'),
+            format=dict(required=False, type='str'),
+            output_file=dict(required=False, type='str'),
+            goss_path=dict(required=False, default='goss', type='str'),
         ),
         supports_check_mode=False
     )
 
-    workdir = os.path.abspath(module.params['cwd'])
-    test_file = module.params['path'] # test file path
+    test_file_path = module.params['path']  # test file path
+    vars_file_path = module.params['vars']  # test vars path
+    output_format = module.params['format']  # goss output format
+    output_file_path = module.params['output_file']
+    goss_path = module.params['goss_path']
 
-    if not os.path.isabs(test_file):
-        test_file = os.path.abspath(os.path.join(workdir, test_file))
+    if test_file_path is None:
+        fail(module, "Test file path is null")
 
-    fmt = module.params['format']  # goss output format
-    executable = module.params['executable']
-    env_vars = module.params['env_vars'] or {}
+    test_file_path = os.path.expanduser(test_file_path)
 
-    if not test_file or len(test_file) == 0:
-        fail(module, "Goss test file is undefined.")
+    # test if access to test file is ok
 
-    # test if test file is a directory
-    if os.path.isdir(test_file):
-        fail(module, "Goss test file {} cannot be a directory.".format(test_file))
+    if not os.access(test_file_path, os.R_OK):
+        fail(module, "Test file %s not readable" % (test_file_path))
 
-    # test if the test file is readable
-    if not os.access(test_file, os.R_OK):
-        fail(module, "Goss test file {} is not readable.".format(test_file))
+    # test if test file is not a dir
+    if os.path.isdir(test_file_path):
+        fail(module, "Test file must be a file ! : %s" % (test_file_path))
 
-    # sanitize the environment variables
-    for key, value in env_vars.items():
-        log("key({}): {}, value({}): {}".format(type(key), key, type(value), value))
+    if vars_file_path is not None:
+        # test if access to vars file is ok
 
-        if isinstance(value, bool):
-            # if it's a boolean, lowercase and convert to string
-            env_vars[key] = str(value).lower()
-        elif isinstance(value, string_types) or isinstance(value, integer_types) or isinstance(value, float):
-            # leave it be
-            continue
-        else:
-            # anything more complicated, let JSON do its thing or just stringify
-            try:
-                env_vars[key] = json.dumps(value)
-            except:
-                env_vars[key] = str(value)
+        if not os.access(vars_file_path, os.R_OK):
+            fail(module, "Vars file %s not readable" % (vars_file_path))
 
-    sys.stderr.write("{}\n".format(env_vars))
+        # test if vars file is not a dir
+        if os.path.isdir(vars_file_path):
+            fail(module, "Vars file must be a file ! : %s" % (vars_file_path))
 
-    rc, stdout, stderr = evaluate(module, test_file, fmt, executable, env_vars, workdir)
+    (rc, out, err) = check(module, test_file_path, vars_file_path, output_format, goss_path)
 
-    result = dict(rc=rc, stdout=stdout, stderr=stderr)
+    if output_file_path is not None:
+        output_file_path = os.path.expanduser(output_file_path)
+        # check if output_file is a file
+        if output_file_path.endswith(os.sep):
+            fail(module, "Output_file must be a file. Actually :  %s "
+                             % (output_file_path))
 
-    succeed(module, **result) if rc == 0 else fail(
-        module, "Goss Tests Failed.", **result
-    )
+        output_dirname = os.path.dirname(output_file_path)
 
+        # check if output directory exists
+        if not os.path.exists(output_dirname):
+            fail(module, "Directory %s does not exists" % (output_dirname))
 
-if __name__ == "__main__":
-    main()
+        # check if writable
+        if not os.access(os.path.dirname(output_file_path), os.W_OK):
+            fail(module, "Destination %s not writable" % (os.path.dirname(output_file_path)))
+        # write goss result on the output file
+        output_file(output_file_path, out)
+
+    if rc is not None and rc != 0:
+        error_msg = "err : %s ; out : %s" % (err, out)
+        fail(module, error_msg)
+
+    result = {}
+    result['stdout'] = out
+
+    succeed(module, **result)
+
+main()

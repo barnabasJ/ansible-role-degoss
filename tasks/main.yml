@@ -37,6 +37,13 @@
   with_items:
     - "{{ goss_real_version }}"
   changed_when: degoss_changed_when
+  when: goss_binary is not defined
+
+# deploy goss binary
+- name: deploy goss binary
+  copy: src={{ goss_binary }} dest={{ degoss_goss_bin }}-{{ goss_real_version}}  mode=0755
+  changed_when: degoss_changed_when
+  when: goss_binary is defined
 
 # symlink
 - name: link
@@ -53,14 +60,19 @@
   with_items: "{{ [goss_file] + goss_addtl_files + goss_addtl_dirs }}"
   changed_when: degoss_changed_when
 
+# deploy vars file
+- name: deploy vars file
+  copy: src={{ goss_vars_file }} dest={{ degoss_test_root }} mode=0644 directory_mode=0755 setype=user_tmp_t
+  changed_when: degoss_changed_when
+  when: goss_vars_file != "None"
+
 # run the tests
 - name: run tests
   goss:
-    executable: "{{ degoss_goss_bin }}"
-    path: "{{ goss_file }}"
-    cwd: "{{ degoss_test_root }}"
+    goss_path: "{{ degoss_goss_bin }}"
+    path: "{{ '%s/%s' | format(degoss_test_root, goss_file | regex_replace('.*/', '')) }}"
+    vars: "{{ '%s/%s' | format(degoss_test_root, goss_vars_file | regex_replace('.*/', '')) if goss_vars_file != 'None' else omit }}"
     format: "{{ goss_output_format }}"
-    env_vars: "{{ goss_env_vars }}"
   failed_when: false
   register: goss_output
   tags: [format_goss_output]
@@ -73,7 +85,7 @@
 
 # our output callback plugin will catch the tag of this and format output accordingly
 - name: report errors
-  fail: msg="Goss Tests Failed."
+  fail: msg={{ goss_output.get('msg') }}
   when: goss_output.get('goss_failed') | bool
   tags: [format_goss_output]
 
